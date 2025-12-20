@@ -424,9 +424,6 @@ async def fake_stream_response_gemini(request_data: dict, model: str):
                 log.error(f"Fake streaming request failed: {e}")
                 raise
 
-            # 发送实际请求
-            # response 已在上面获取
-
             # 处理结果
             try:
                 if hasattr(response, "body"):

@@ -256,9 +256,6 @@ async def fake_stream_response(api_payload: dict, cred_mgr: CredentialManager) -
                 log.error(f"Fake streaming request failed: {e}")
                 raise
 
-            # 发送实际请求
-            # response 已在上面获取
-
             # 处理结果
             if hasattr(response, "body"):
                 body_str = (
@@ -377,54 +374,60 @@ async def fake_stream_response(api_payload: dict, cred_mgr: CredentialManager) -
     return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
 
-async def convert_streaming_response(gemini_response, model: str) -> StreamingResponse:
+async def convert_streaming_response(gemini_response, model: str):
     """转换流式响应为OpenAI格式"""
+    # 检查响应类型，如果不是StreamingResponse，直接返回错误响应
+    if not hasattr(gemini_response, "body_iterator"):
+        log.error(f"Unexpected response type: {type(gemini_response)}")
+        
+        # 尝试从Response对象中提取状态码和错误信息
+        status_code = 500
+        error_message = "Response type error"
+        
+        if hasattr(gemini_response, "status_code"):
+            status_code = gemini_response.status_code
+        
+        if hasattr(gemini_response, "body"):
+            try:
+                body_content = gemini_response.body
+                if isinstance(body_content, bytes):
+                    body_content = body_content.decode("utf-8")
+                error_data = json.loads(body_content)
+                if "error" in error_data and "message" in error_data["error"]:
+                    error_message = error_data["error"]["message"]
+            except Exception:
+                pass
+        
+        # 返回正确的HTTP错误状态码
+        raise HTTPException(status_code=status_code, detail=error_message)
+    
     response_id = str(uuid.uuid4())
 
     async def openai_stream_generator():
         try:
-            # 处理不同类型的响应对象
-            if hasattr(gemini_response, "body_iterator"):
-                # FastAPI StreamingResponse
-                async for chunk in gemini_response.body_iterator:
-                    if not chunk:
-                        continue
+            # FastAPI StreamingResponse
+            async for chunk in gemini_response.body_iterator:
+                if not chunk:
+                    continue
 
-                    # 处理不同数据类型的startswith问题
-                    if isinstance(chunk, bytes):
-                        if not chunk.startswith(b"data: "):
-                            continue
-                        payload = chunk[len(b"data: ") :]
-                    else:
-                        chunk_str = str(chunk)
-                        if not chunk_str.startswith("data: "):
-                            continue
-                        payload = chunk_str[len("data: ") :].encode()
-                    try:
-                        gemini_chunk = json.loads(payload.decode())
-                        openai_chunk = gemini_stream_chunk_to_openai(
-                            gemini_chunk, model, response_id
-                        )
-                        yield f"data: {json.dumps(openai_chunk, separators=(',', ':'))}\n\n".encode()
-                    except json.JSONDecodeError:
+                # 处理不同数据类型的startswith问题
+                if isinstance(chunk, bytes):
+                    if not chunk.startswith(b"data: "):
                         continue
-            else:
-                # 其他类型的响应，尝试直接处理
-                log.warning(f"Unexpected response type: {type(gemini_response)}")
-                error_chunk = {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"role": "assistant", "content": "Response type error"},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                }
-                yield f"data: {json.dumps(error_chunk)}\n\n".encode()
+                    payload = chunk[len(b"data: ") :]
+                else:
+                    chunk_str = str(chunk)
+                    if not chunk_str.startswith("data: "):
+                        continue
+                    payload = chunk_str[len("data: ") :].encode()
+                try:
+                    gemini_chunk = json.loads(payload.decode())
+                    openai_chunk = gemini_stream_chunk_to_openai(
+                        gemini_chunk, model, response_id
+                    )
+                    yield f"data: {json.dumps(openai_chunk, separators=(',', ':'))}\n\n".encode()
+                except json.JSONDecodeError:
+                    continue
 
             # 发送结束标记
             yield "data: [DONE]\n\n".encode()
