@@ -156,6 +156,25 @@ async def generate_content(
     # 发送请求（429重试已在google_api_client中处理）
     response = await send_gemini_request(api_payload, False, cred_mgr)
 
+    # 检查响应状态码
+    response_status_code = getattr(response, "status_code", 200)
+    if response_status_code != 200:
+        # 返回错误响应，保留原始状态码
+        error_message = f"API error: {response_status_code}"
+        try:
+            if hasattr(response, "body"):
+                body_content = response.body.decode() if isinstance(response.body, bytes) else response.body
+            elif hasattr(response, "content"):
+                body_content = response.content.decode() if isinstance(response.content, bytes) else response.content
+            else:
+                body_content = str(response)
+            error_data = json.loads(body_content)
+            if "error" in error_data and "message" in error_data["error"]:
+                error_message = error_data["error"]["message"]
+        except Exception:
+            pass
+        raise HTTPException(status_code=response_status_code, detail=error_message)
+
     # 处理响应
     try:
         if hasattr(response, "body"):

@@ -182,6 +182,25 @@ async def chat_completions(
     if is_streaming:
         return await convert_streaming_response(response, model)
 
+    # 检查非流式响应的状态码
+    response_status_code = getattr(response, "status_code", 200)
+    if response_status_code != 200:
+        # 返回错误响应，保留原始状态码
+        error_message = f"API error: {response_status_code}"
+        try:
+            if hasattr(response, "body"):
+                body_content = response.body.decode() if isinstance(response.body, bytes) else response.body
+            elif hasattr(response, "content"):
+                body_content = response.content.decode() if isinstance(response.content, bytes) else response.content
+            else:
+                body_content = str(response)
+            error_data = json.loads(body_content)
+            if "error" in error_data and "message" in error_data["error"]:
+                error_message = error_data["error"]["message"]
+        except Exception:
+            pass
+        raise HTTPException(status_code=response_status_code, detail=error_message)
+
     # 转换非流式响应
     try:
         if hasattr(response, "body"):
