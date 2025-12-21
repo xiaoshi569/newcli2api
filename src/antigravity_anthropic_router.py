@@ -14,6 +14,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from log import log
 
 from .antigravity_api import (
+    AntigravityAPIError,
     build_antigravity_request_body,
     send_antigravity_request_no_stream,
     send_antigravity_request_stream,
@@ -459,6 +460,9 @@ async def anthropic_messages(
         try:
             resources, cred_name, _ = await send_antigravity_request_stream(request_body, cred_mgr)
             response, stream_ctx, client = resources
+        except AntigravityAPIError as e:
+            log.error(f"[ANTHROPIC] 下游流式请求失败: {e}")
+            return _anthropic_error(status_code=e.status_code, message=e.message, error_type="api_error")
         except Exception as e:
             log.error(f"[ANTHROPIC] 下游流式请求失败: {e}")
             return _anthropic_error(status_code=500, message="下游请求失败", error_type="api_error")
@@ -490,6 +494,9 @@ async def anthropic_messages(
     request_id = f"msg_{int(time.time() * 1000)}"
     try:
         response_data, _, _ = await send_antigravity_request_no_stream(request_body, cred_mgr)
+    except AntigravityAPIError as e:
+        log.error(f"[ANTHROPIC] 下游非流式请求失败: {e}")
+        return _anthropic_error(status_code=e.status_code, message=e.message, error_type="api_error")
     except Exception as e:
         log.error(f"[ANTHROPIC] 下游非流式请求失败: {e}")
         return _anthropic_error(status_code=500, message="下游请求失败", error_type="api_error")

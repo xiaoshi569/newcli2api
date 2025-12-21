@@ -424,7 +424,46 @@ async def fake_stream_response_gemini(request_data: dict, model: str):
                 log.error(f"Fake streaming request failed: {e}")
                 raise
 
-            # 处理结果
+            # 处理结果 - 首先检查响应状态码
+            response_status_code = getattr(response, "status_code", 200)
+            if response_status_code != 200:
+                log.error(f"Gemini fake stream received error response with status {response_status_code}")
+                # 尝试提取错误信息
+                error_message = f"API error: {response_status_code}"
+                try:
+                    if hasattr(response, "body"):
+                        body_content = response.body.decode() if isinstance(response.body, bytes) else str(response.body)
+                    elif hasattr(response, "content"):
+                        body_content = response.content.decode() if isinstance(response.content, bytes) else str(response.content)
+                    else:
+                        body_content = str(response)
+                    error_data = json.loads(body_content)
+                    if "error" in error_data and "message" in error_data["error"]:
+                        error_message = error_data["error"]["message"]
+                except Exception:
+                    pass
+                
+                error_chunk = {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [{"text": f"[错误] {error_message}"}],
+                                "role": "model",
+                            },
+                            "finishReason": "ERROR",
+                            "index": 0,
+                        }
+                    ],
+                    "error": {
+                        "message": error_message,
+                        "type": "api_error",
+                        "code": response_status_code,
+                    }
+                }
+                yield f"data: {json.dumps(error_chunk)}\n\n".encode()
+                yield "data: [DONE]\n\n".encode()
+                return
+
             try:
                 if hasattr(response, "body"):
                     response_data = json.loads(

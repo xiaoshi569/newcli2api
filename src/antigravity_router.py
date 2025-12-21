@@ -16,6 +16,7 @@ from log import log
 from src.utils import is_anti_truncation_model, authenticate_bearer, authenticate_gemini_flexible, authenticate_sdwebui_flexible
 
 from .antigravity_api import (
+    AntigravityAPIError,
     build_antigravity_request_body,
     send_antigravity_request_no_stream,
     send_antigravity_request_stream,
@@ -913,6 +914,9 @@ async def chat_completions(
             openai_response = convert_antigravity_response_to_openai(response_data, model, request_id)
             return JSONResponse(content=openai_response)
 
+    except AntigravityAPIError as e:
+        log.error(f"[ANTIGRAVITY] Request failed: {e}")
+        raise HTTPException(status_code=e.status_code, detail=e.message)
     except Exception as e:
         log.error(f"[ANTIGRAVITY] Request failed: {e}")
         raise HTTPException(status_code=500, detail=f"Antigravity API request failed: {str(e)}")
@@ -1096,6 +1100,9 @@ async def gemini_generate_content(
         gemini_response = convert_antigravity_response_to_gemini(response_data)
         return JSONResponse(content=gemini_response)
 
+    except AntigravityAPIError as e:
+        log.error(f"[ANTIGRAVITY GEMINI] Request failed: {e}")
+        raise HTTPException(status_code=e.status_code, detail=e.message)
     except Exception as e:
         log.error(f"[ANTIGRAVITY GEMINI] Request failed: {e}")
         raise HTTPException(status_code=500, detail=f"Antigravity API request failed: {str(e)}")
@@ -1240,6 +1247,9 @@ async def gemini_stream_generate_content(
             media_type="text/event-stream"
         )
 
+    except AntigravityAPIError as e:
+        log.error(f"[ANTIGRAVITY GEMINI] Stream request failed: {e}")
+        raise HTTPException(status_code=e.status_code, detail=e.message)
     except Exception as e:
         log.error(f"[ANTIGRAVITY GEMINI] Stream request failed: {e}")
         raise HTTPException(status_code=500, detail=f"Antigravity API request failed: {str(e)}")
@@ -1443,6 +1453,9 @@ async def sdwebui_txt2img(request: Request, _: str = Depends(authenticate_sdwebu
 
         return JSONResponse(content=sdwebui_response)
 
+    except AntigravityAPIError as e:
+        log.error(f"[ANTIGRAVITY SD-WebUI] txt2img request failed: {e}")
+        raise HTTPException(status_code=e.status_code, detail=e.message)
     except Exception as e:
         log.error(f"[ANTIGRAVITY SD-WebUI] txt2img request failed: {e}")
         raise HTTPException(status_code=500, detail=f"Image generation failed: {str(e)}")

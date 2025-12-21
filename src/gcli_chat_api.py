@@ -309,24 +309,28 @@ async def send_gemini_request(
                             continue
 
                         # 不需要重试，返回错误流
+                        log.error(f"[FINAL] Max retries exhausted, returning error stream with status {resp.status_code}")
                         error_msg = f"API error: {resp.status_code}"
                         if await _check_should_auto_ban(resp.status_code):
                             error_msg += " (credential auto-banned)"
+
+                        # 捕获当前状态码，避免闭包问题
+                        final_status_code = resp.status_code
 
                         async def error_stream():
                             error_response = {
                                 "error": {
                                     "message": error_msg,
                                     "type": "api_error",
-                                    "code": resp.status_code,
+                                    "code": final_status_code,
                                 }
                             }
-                            yield f"data: {json.dumps(error_response)}\n\n"
+                            yield f"data: {json.dumps(error_response)}\n\n".encode("utf-8")
 
                         return StreamingResponse(
                             error_stream(),
                             media_type="text/event-stream",
-                            status_code=resp.status_code,
+                            status_code=final_status_code,
                         )
                     else:
                         # 成功响应，传递所有资源给流式处理函数管理
@@ -527,10 +531,26 @@ def _handle_streaming_response_managed(
         success_recorded = False
         chunk_count = 0  # 使用局部变量代替函数属性
         bytes_transferred = 0  # 跟踪传输的字节数
+        has_yielded_content = False  # 跟踪是否输出过内容
         return_thoughts = await get_return_thoughts_to_frontend()  # 获取配置
         try:
             async for chunk in resp.aiter_lines():
                 if not chunk or not chunk.startswith("data: "):
+                    # 检查是否是非 SSE 格式的错误响应
+                    if chunk and not has_yielded_content:
+                        try:
+                            error_obj = json.loads(chunk)
+                            if "error" in error_obj:
+                                # Google API 返回了错误 JSON
+                                log.error(f"Google API returned error in stream: {chunk[:500]}")
+                                err_msg = error_obj.get("error", {}).get("message", "Unknown error")
+                                err_code = error_obj.get("error", {}).get("code", 500)
+                                err = {"error": {"message": err_msg, "type": "api_error", "code": err_code}}
+                                yield f"data: {json.dumps(err)}\n\n".encode()
+                                has_yielded_content = True
+                                return
+                        except json.JSONDecodeError:
+                            pass
                     continue
 
                 # 记录第一次成功响应（使用模型组 CD）
@@ -544,13 +564,28 @@ def _handle_streaming_response_managed(
                 payload = chunk[len("data: ") :]
                 try:
                     obj = json.loads(payload)
+                    # 检查是否是错误响应
+                    if "error" in obj and not has_yielded_content:
+                        log.error(f"Google API returned error in SSE stream: {payload[:500]}")
+                        yield f"data: {json.dumps(obj, separators=(',', ':'))}\n\n".encode()
+                        has_yielded_content = True
+                        continue
+                    
                     if "response" in obj:
                         data = obj["response"]
+                        # 检查 response 中是否包含错误
+                        if "error" in data and not has_yielded_content:
+                            log.error(f"Google API returned error in response: {json.dumps(data)[:500]}")
+                            yield f"data: {json.dumps(data, separators=(',', ':'))}\n\n".encode()
+                            has_yielded_content = True
+                            continue
+                        
                         # 如果配置为不返回思维链，则过滤
                         if not return_thoughts:
                             data = _filter_thoughts_from_response(data)
                         chunk_data = f"data: {json.dumps(data, separators=(',', ':'))}\n\n".encode()
                         yield chunk_data
+                        has_yielded_content = True
                         await asyncio.sleep(0)  # 让其他协程有机会运行
 
                         # 基于传输字节数触发GC，而不是chunk数量
@@ -563,8 +598,15 @@ def _handle_streaming_response_managed(
                             log.debug(f"Triggered GC after {chunk_count} chunks (~10MB transferred)")
                     else:
                         yield f"data: {json.dumps(obj, separators=(',', ':'))}\n\n".encode()
+                        has_yielded_content = True
                 except json.JSONDecodeError:
                     continue
+
+            # 如果流结束但没有输出任何内容，返回错误
+            if not has_yielded_content:
+                log.error("Stream ended without yielding any content")
+                err = {"error": {"message": "Empty response from API", "type": "api_error", "code": 500}}
+                yield f"data: {json.dumps(err)}\n\n".encode()
 
         except Exception as e:
             log.error(f"Streaming error: {e}")

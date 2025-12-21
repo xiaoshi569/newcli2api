@@ -226,6 +226,43 @@ class AntiTruncationStreamProcessor:
             try:
                 response = await self.original_request_func(current_payload)
 
+                # 检查响应状态码
+                response_status_code = getattr(response, "status_code", 200)
+                if response_status_code != 200:
+                    log.error(f"Anti-truncation received error response with status {response_status_code}")
+                    # 尝试提取错误信息
+                    error_message = f"API error: {response_status_code}"
+                    if isinstance(response, StreamingResponse):
+                        # 对于流式响应，直接传递错误流
+                        async for chunk in response.body_iterator:
+                            yield chunk
+                        return
+                    else:
+                        # 非流式错误响应
+                        try:
+                            if hasattr(response, "body"):
+                                body_content = response.body.decode() if isinstance(response.body, bytes) else str(response.body)
+                            elif hasattr(response, "content"):
+                                body_content = response.content.decode() if isinstance(response.content, bytes) else str(response.content)
+                            else:
+                                body_content = str(response)
+                            error_data = json.loads(body_content)
+                            if "error" in error_data and "message" in error_data["error"]:
+                                error_message = error_data["error"]["message"]
+                        except Exception:
+                            pass
+                        
+                        error_chunk = {
+                            "error": {
+                                "message": error_message,
+                                "type": "api_error",
+                                "code": response_status_code,
+                            }
+                        }
+                        yield f"data: {json.dumps(error_chunk)}\n\n".encode()
+                        yield b"data: [DONE]\n\n"
+                        return
+
                 if not isinstance(response, StreamingResponse):
                     # 非流式响应，直接处理
                     yield await self._handle_non_streaming_response(response)

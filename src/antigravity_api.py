@@ -24,6 +24,15 @@ from .httpx_client import create_streaming_client_with_kwargs, http_client
 from .models import Model, model_to_dict
 from .utils import ANTIGRAVITY_USER_AGENT, parse_quota_reset_timestamp
 
+
+class AntigravityAPIError(Exception):
+    """Antigravity API 错误，保留原始状态码"""
+    def __init__(self, status_code: int, message: str):
+        self.status_code = status_code
+        self.message = message
+        super().__init__(f"Antigravity API error ({status_code}): {message}")
+
+
 async def _check_should_auto_ban(status_code: int) -> bool:
     """检查是否应该触发自动封禁"""
     return (
@@ -258,7 +267,7 @@ async def send_antigravity_request_stream(
                     await asyncio.sleep(retry_interval)
                     continue
 
-                raise Exception(f"Antigravity API error ({response.status_code}): {error_text[:200]}")
+                raise AntigravityAPIError(response.status_code, error_text[:200])
 
             except Exception as stream_error:
                 # 确保在异常情况下也清理资源
@@ -387,7 +396,7 @@ async def send_antigravity_request_no_stream(
                     await asyncio.sleep(retry_interval)
                     continue
 
-                raise Exception(f"Antigravity API error ({response.status_code}): {error_body[:200]}")
+                raise AntigravityAPIError(response.status_code, error_body[:200])
 
         except Exception as e:
             log.error(f"[ANTIGRAVITY] Request failed with credential {current_file}: {e}")

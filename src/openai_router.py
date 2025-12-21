@@ -256,7 +256,47 @@ async def fake_stream_response(api_payload: dict, cred_mgr: CredentialManager) -
                 log.error(f"Fake streaming request failed: {e}")
                 raise
 
-            # 处理结果
+            # 处理结果 - 首先检查响应状态码
+            response_status_code = getattr(response, "status_code", 200)
+            if response_status_code != 200:
+                log.error(f"Fake stream received error response with status {response_status_code}")
+                # 尝试提取错误信息
+                error_message = f"API error: {response_status_code}"
+                try:
+                    if hasattr(response, "body"):
+                        body_content = response.body.decode() if isinstance(response.body, bytes) else str(response.body)
+                    elif hasattr(response, "content"):
+                        body_content = response.content.decode() if isinstance(response.content, bytes) else str(response.content)
+                    else:
+                        body_content = str(response)
+                    error_data = json.loads(body_content)
+                    if "error" in error_data and "message" in error_data["error"]:
+                        error_message = error_data["error"]["message"]
+                except Exception:
+                    pass
+                
+                error_chunk = {
+                    "id": str(uuid.uuid4()),
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": "gcli2api-streaming",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": f"[错误] {error_message}"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "error": {
+                        "message": error_message,
+                        "type": "api_error",
+                        "code": response_status_code,
+                    }
+                }
+                yield f"data: {json.dumps(error_chunk)}\n\n".encode()
+                yield "data: [DONE]\n\n".encode()
+                return
+
             if hasattr(response, "body"):
                 body_str = (
                     response.body.decode()
@@ -401,6 +441,9 @@ async def convert_streaming_response(gemini_response, model: str):
         # 返回正确的HTTP错误状态码
         raise HTTPException(status_code=status_code, detail=error_message)
     
+    # 保留原始响应的状态码
+    original_status_code = getattr(gemini_response, "status_code", 200)
+    
     response_id = str(uuid.uuid4())
 
     async def openai_stream_generator():
@@ -450,4 +493,4 @@ async def convert_streaming_response(gemini_response, model: str):
             yield f"data: {json.dumps(error_chunk)}\n\n".encode()
             yield "data: [DONE]\n\n".encode()
 
-    return StreamingResponse(openai_stream_generator(), media_type="text/event-stream")
+    return StreamingResponse(openai_stream_generator(), media_type="text/event-stream", status_code=original_status_code)
