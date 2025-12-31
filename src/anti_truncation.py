@@ -196,6 +196,7 @@ class AntiTruncationStreamProcessor:
         # 使用 StringIO 避免字符串拼接的内存问题
         self.collected_content = io.StringIO()
         self.current_attempt = 0
+        self.first_response = None  # 用于存储第一次响应
 
     def _get_collected_text(self) -> str:
         """获取收集的文本内容"""
@@ -210,6 +211,198 @@ class AntiTruncationStreamProcessor:
         """清空收集的内容，释放内存"""
         self.collected_content.close()
         self.collected_content = io.StringIO()
+
+    async def process_stream_with_first_response(self) -> AsyncGenerator[bytes, None]:
+        """使用已有的第一次响应处理流式响应"""
+        if self.first_response is None:
+            # 如果没有第一次响应，回退到原始方法
+            async for chunk in self.process_stream():
+                yield chunk
+            return
+
+        self.current_attempt = 1  # 第一次尝试已完成
+        response = self.first_response
+
+        # 处理第一次响应
+        if not isinstance(response, StreamingResponse):
+            yield await self._handle_non_streaming_response(response)
+            return
+
+        # 处理流式响应
+        chunk_buffer = io.StringIO()
+        found_done_marker = False
+
+        async for chunk in response.body_iterator:
+            if not chunk:
+                yield chunk
+                continue
+
+            # 处理不同数据类型的startswith问题
+            if isinstance(chunk, bytes):
+                if not chunk.startswith(b"data: "):
+                    yield chunk
+                    continue
+                payload_data = chunk[len(b"data: "):]
+            else:
+                chunk_str = str(chunk)
+                if not chunk_str.startswith("data: "):
+                    yield chunk
+                    continue
+                payload_data = chunk_str[len("data: "):].encode()
+
+            if payload_data.strip() == b"[DONE]":
+                if found_done_marker:
+                    log.info("Anti-truncation: Found [done] marker, output complete")
+                    yield chunk
+                    chunk_buffer.close()
+                    self._clear_content()
+                    return
+                else:
+                    log.warning("Anti-truncation: Stream ended without [done] marker")
+                    break
+
+            try:
+                data = json.loads(payload_data.decode())
+                content = self._extract_content_from_chunk(data)
+
+                if content:
+                    chunk_buffer.write(content)
+                    if self._check_done_marker_in_chunk_content(content):
+                        found_done_marker = True
+                        log.info("Anti-truncation: Found [done] marker in chunk")
+
+                cleaned_chunk = self._remove_done_marker_from_chunk(chunk, data)
+                yield cleaned_chunk
+
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                yield chunk
+                continue
+
+        # 更新收集的内容
+        chunk_text = chunk_buffer.getvalue()
+        if chunk_text:
+            self._append_content(chunk_text)
+        chunk_buffer.close()
+
+        if found_done_marker:
+            self._clear_content()
+            yield b"data: [DONE]\n\n"
+            return
+
+        # 检查累积内容中是否有done标记
+        if not found_done_marker:
+            accumulated_text = self._get_collected_text()
+            if self._check_done_marker_in_text(accumulated_text):
+                log.info("Anti-truncation: Found [done] marker in accumulated content")
+                self._clear_content()
+                yield b"data: [DONE]\n\n"
+                return
+
+        # 继续后续的续传尝试
+        while self.current_attempt < self.max_attempts:
+            self.current_attempt += 1
+            async for chunk in self._continue_stream():
+                yield chunk
+                if chunk == b"data: [DONE]\n\n":
+                    return
+
+        # 所有尝试都完成
+        log.warning("Anti-truncation: Max attempts reached, ending stream")
+        self._clear_content()
+        yield b"data: [DONE]\n\n"
+
+    async def _continue_stream(self) -> AsyncGenerator[bytes, None]:
+        """继续流式传输（用于续传）"""
+        current_payload = self._build_current_payload()
+        log.debug(f"Anti-truncation continuation attempt {self.current_attempt}/{self.max_attempts}")
+
+        try:
+            response = await self.original_request_func(current_payload)
+
+            response_status_code = getattr(response, "status_code", 200)
+            if response_status_code != 200:
+                log.error(f"Anti-truncation continuation failed with status {response_status_code}")
+                error_chunk = {
+                    "error": {
+                        "message": f"API error: {response_status_code}",
+                        "type": "api_error",
+                        "code": response_status_code,
+                    }
+                }
+                yield f"data: {json.dumps(error_chunk)}\n\n".encode()
+                yield b"data: [DONE]\n\n"
+                return
+
+            if not isinstance(response, StreamingResponse):
+                yield await self._handle_non_streaming_response(response)
+                return
+
+            chunk_buffer = io.StringIO()
+            found_done_marker = False
+
+            async for chunk in response.body_iterator:
+                if not chunk:
+                    yield chunk
+                    continue
+
+                if isinstance(chunk, bytes):
+                    if not chunk.startswith(b"data: "):
+                        yield chunk
+                        continue
+                    payload_data = chunk[len(b"data: "):]
+                else:
+                    chunk_str = str(chunk)
+                    if not chunk_str.startswith("data: "):
+                        yield chunk
+                        continue
+                    payload_data = chunk_str[len("data: "):].encode()
+
+                if payload_data.strip() == b"[DONE]":
+                    if found_done_marker:
+                        log.info("Anti-truncation: Found [done] marker in continuation")
+                        yield chunk
+                        chunk_buffer.close()
+                        self._clear_content()
+                        return
+                    else:
+                        break
+
+                try:
+                    data = json.loads(payload_data.decode())
+                    content = self._extract_content_from_chunk(data)
+
+                    if content:
+                        chunk_buffer.write(content)
+                        if self._check_done_marker_in_chunk_content(content):
+                            found_done_marker = True
+
+                    cleaned_chunk = self._remove_done_marker_from_chunk(chunk, data)
+                    yield cleaned_chunk
+
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    yield chunk
+                    continue
+
+            chunk_text = chunk_buffer.getvalue()
+            if chunk_text:
+                self._append_content(chunk_text)
+            chunk_buffer.close()
+
+            if found_done_marker:
+                self._clear_content()
+                yield b"data: [DONE]\n\n"
+
+        except Exception as e:
+            log.error(f"Anti-truncation continuation error: {str(e)}")
+            error_chunk = {
+                "error": {
+                    "message": f"Anti-truncation failed: {str(e)}",
+                    "type": "api_error",
+                    "code": 500,
+                }
+            }
+            yield f"data: {json.dumps(error_chunk)}\n\n".encode()
+            yield b"data: [DONE]\n\n"
 
     async def process_stream(self) -> AsyncGenerator[bytes, None]:
         """处理流式响应，检测并处理截断"""
@@ -682,8 +875,51 @@ async def apply_anti_truncation_to_stream(
         lambda p: request_func(p), anti_truncation_payload, max_attempts
     )
 
+    # 先发送一次请求检查状态码
+    first_response = await request_func(anti_truncation_payload)
+    first_status_code = getattr(first_response, "status_code", 200)
+    
+    if first_status_code != 200:
+        # 如果第一次请求就失败，直接返回错误响应
+        log.error(f"Anti-truncation first request failed with status {first_status_code}")
+        if isinstance(first_response, StreamingResponse):
+            # 直接返回原始错误流，保留状态码
+            return first_response
+        else:
+            # 非流式错误响应，包装成流式
+            error_message = f"API error: {first_status_code}"
+            try:
+                if hasattr(first_response, "body"):
+                    body_content = first_response.body.decode() if isinstance(first_response.body, bytes) else str(first_response.body)
+                elif hasattr(first_response, "content"):
+                    body_content = first_response.content.decode() if isinstance(first_response.content, bytes) else str(first_response.content)
+                else:
+                    body_content = str(first_response)
+                error_data = json.loads(body_content)
+                if "error" in error_data and "message" in error_data["error"]:
+                    error_message = error_data["error"]["message"]
+            except Exception:
+                pass
+            
+            async def error_stream():
+                error_chunk = {
+                    "error": {
+                        "message": error_message,
+                        "type": "api_error",
+                        "code": first_status_code,
+                    }
+                }
+                yield f"data: {json.dumps(error_chunk)}\n\n".encode()
+                yield b"data: [DONE]\n\n"
+            
+            return StreamingResponse(error_stream(), media_type="text/event-stream", status_code=first_status_code)
+
+    # 第一次请求成功，使用处理器处理（包括后续的续传尝试）
+    # 重置处理器，让它从第一次响应开始处理
+    processor.first_response = first_response
+    
     # 返回包装后的流式响应
-    return StreamingResponse(processor.process_stream(), media_type="text/event-stream")
+    return StreamingResponse(processor.process_stream_with_first_response(), media_type="text/event-stream")
 
 
 def is_anti_truncation_enabled(request_data: Dict[str, Any]) -> bool:
